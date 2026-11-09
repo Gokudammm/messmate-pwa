@@ -1,13 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity, ArrowDownToLine, ArrowUpFromLine, Banknote, CalendarDays, Check,
-  ChevronDown, CirclePlus, Coffee, CreditCard, IndianRupee, LayoutDashboard,
-  Menu, Pencil, Plus, ReceiptText, Settings2, Trash2, Utensils, Wallet, X
+  ChevronDown, CirclePlus, Cloud, Coffee, CreditCard, IndianRupee, LayoutDashboard,
+  LoaderCircle, LogOut, Menu, Pencil, Plus, ReceiptText, RefreshCw, Settings2,
+  Trash2, Utensils, Wallet, X
 } from "lucide-react";
+import { firebaseConfigured, loadFirebaseAuth, missingFirebaseConfig } from "./firebase";
 import "./styles.css";
+import "./cloud.css";
 
+const AuthScreen = lazy(() => import("./AuthScreen"));
 const STORE_KEY = "messmate-data-v1";
+const MIGRATION_KEY = "messmate-cloud-migration-complete";
 const today = () => new Date().toISOString().slice(0, 10);
 const defaultItems = [
   { id: "tea", name: "Tea", price: 10 },
@@ -25,8 +30,110 @@ function loadData() {
     return saved && Array.isArray(saved.items) && Array.isArray(saved.bills) ? saved : starter;
   } catch { return starter; }
 }
+function validDocumentId(id) {
+  return typeof id === "string" && id.length > 0 && !id.includes("/") && id !== "." && id !== "..";
+}
+function validData(value) {
+  return value && Array.isArray(value.items) && Array.isArray(value.bills)
+    && value.items.every(item => item && validDocumentId(item.id) && typeof item.name === "string" && Number.isFinite(Number(item.price)))
+    && value.bills.every(bill => bill && validDocumentId(bill.id) && Array.isArray(bill.lines) && Number.isFinite(Number(bill.total)));
+}
+function loadMigrationData() {
+  try {
+    const saved = localStorage.getItem(STORE_KEY);
+    if (!saved) return null;
+    const parsed = JSON.parse(saved);
+    return validData(parsed) ? parsed : null;
+  } catch { return null; }
+}
+function equalData(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+function mergeCollection(base, local, remote) {
+  const baseById = new Map(base.map(item => [item.id, item]));
+  const localById = new Map(local.map(item => [item.id, item]));
+  const remoteById = new Map(remote.map(item => [item.id, item]));
+  const ids = new Set([...remoteById.keys(), ...localById.keys()]);
+  const merged = [];
+  for (const id of ids) {
+    const localChanged = !equalData(baseById.get(id), localById.get(id));
+    const selected = localChanged ? localById : remoteById;
+    if (selected.has(id)) merged.push(selected.get(id));
+  }
+  return merged;
+}
+function mergeData(base, local, remote) {
+  return {
+    items: mergeCollection(base.items, local.items, remote.items),
+    bills: mergeCollection(base.bills, local.bills, remote.bills)
+  };
+}
+function mergeMigrationData(local, remote) {
+  const remoteItemIds = new Set(remote.items.map(item => item.id));
+  const remoteBillIds = new Set(remote.bills.map(bill => bill.id));
+  return {
+    items: [...remote.items, ...local.items.filter(item => !remoteItemIds.has(item.id))],
+    bills: [...remote.bills, ...local.bills.filter(bill => !remoteBillIds.has(bill.id))]
+      .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+  };
+}
+async function writeDataChanges(firestore, uid, before, after) {
+  const writes = [];
+  for (const name of ["items", "bills"]) {
+    const previous = new Map(before[name].map(item => [item.id, item]));
+    const current = new Map(after[name].map(item => [item.id, item]));
+    after[name].forEach((item, index) => {
+      if (!equalData(previous.get(item.id), item)) {
+        const value = name === "items" ? { ...item, _order: index } : item;
+        writes.push({ type: "set", ref: firestore.doc(firestore.db, "users", uid, name, item.id), value });
+      }
+    });
+    for (const item of before[name]) {
+      if (!current.has(item.id)) writes.push({ type: "delete", ref: firestore.doc(firestore.db, "users", uid, name, item.id) });
+    }
+  }
+  for (let offset = 0; offset < writes.length; offset += 450) {
+    const batch = firestore.writeBatch(firestore.db);
+    for (const write of writes.slice(offset, offset + 450)) {
+      if (write.type === "set") batch.set(write.ref, write.value);
+      else batch.delete(write.ref);
+    }
+    await batch.commit();
+  }
+}
+function readCloudItems(snapshot) {
+  return snapshot.docs
+    .map(item => ({ ...item.data(), id: item.id }))
+    .sort((a, b) => (a._order ?? 0) - (b._order ?? 0))
+    .map(({ _order, ...item }) => item);
+}
+function readCloudBills(snapshot) {
+  return snapshot.docs
+    .map(item => ({ ...item.data(), id: item.id }))
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+}
+function SyncGate({ error, onRetry, onSignOut }) {
+  return <main className="auth-page"><section className="auth-card sync-gate">
+    <div className="auth-brand"><div className="auth-brand-mark"><Utensils size={21}/></div><div><b>messmate</b><small>MESS MANAGEMENT</small></div></div>
+    <LoaderCircle className={error ? "gate-icon failed" : "gate-icon spinning"} size={30}/>
+    <h1>{error ? "Could not load your data" : "Connecting your workspace..."}</h1>
+    <p>{error || "Fetching your menu and bills from secure cloud storage."}</p>
+    {error && <button className="primary-btn auth-submit" onClick={onRetry}><RefreshCw size={16}/> Try again</button>}
+    {onSignOut && <button className="auth-text-button" onClick={onSignOut}>Sign out</button>}
+  </section></main>;
+}
 function App() {
   const [data, setData] = useState(loadData);
+  const dataRef = useRef(data);
+  const lastSyncedDataRef = useRef(data);
+  const remoteDataRef = useRef({ items: [], bills: [] });
+  const remoteRevisionRef = useRef(0);
+  const syncQueueRef = useRef(Promise.resolve());
+  const [user, setUser] = useState(null);
+  const [firebaseClient, setFirebaseClient] = useState(null);
+  const [firestore, setFirestore] = useState(null);
+  const [authLoading, setAuthLoading] = useState(firebaseConfigured);
+  const [readyUserId, setReadyUserId] = useState(null);
+  const [syncError, setSyncError] = useState("");
+  const [syncRetry, setSyncRetry] = useState(0);
   const [shift, setShift] = useState("Morning");
   const [page, setPage] = useState("Overview");
   const [date, setDate] = useState(today());
@@ -39,15 +146,38 @@ function App() {
   const [showAddItem, setShowAddItem] = useState(false);
   const [notice, setNotice] = useState("");
   const [mobileNav, setMobileNav] = useState(false);
+  dataRef.current = data;
+  const activeSyncRef = useRef({ uid: null, readyUid: null });
+  activeSyncRef.current = { uid: user?.uid || null, readyUid: readyUserId };
 
   useEffect(() => {
-    localStorage.setItem(STORE_KEY, JSON.stringify(data));
-    const channel = new BroadcastChannel("messmate-sync");
-    channel.postMessage(data);
-    channel.close();
-  }, [data]);
+    if (!firebaseConfigured) {
+      localStorage.setItem(STORE_KEY, JSON.stringify(data));
+      const channel = new BroadcastChannel("messmate-sync");
+      channel.postMessage(data);
+      channel.close();
+      return;
+    }
+    if (!user || !firestore || readyUserId !== user.uid) return;
+    localStorage.setItem(`${STORE_KEY}-${user.uid}`, JSON.stringify(data));
+    const uid = user.uid;
+    const target = data;
+    syncQueueRef.current = syncQueueRef.current.catch(() => {}).then(async () => {
+      if (activeSyncRef.current.uid !== uid || activeSyncRef.current.readyUid !== uid) return;
+      const previous = lastSyncedDataRef.current;
+      if (equalData(previous, target)) return;
+      const revision = remoteRevisionRef.current;
+      await writeDataChanges(firestore, uid, previous, target);
+      if (activeSyncRef.current.uid !== uid) return;
+      if (remoteRevisionRef.current === revision) lastSyncedDataRef.current = target;
+      setSyncError("");
+    }).catch(error => {
+      if (activeSyncRef.current.uid === uid) setSyncError(`Cloud sync failed: ${error.message}`);
+    });
+  }, [data, user, firestore, readyUserId, syncRetry]);
 
   useEffect(() => {
+    if (firebaseConfigured) return undefined;
     const channel = new BroadcastChannel("messmate-sync");
     channel.onmessage = (event) => {
       if (event.data && Array.isArray(event.data.items) && Array.isArray(event.data.bills)) {
@@ -62,6 +192,129 @@ function App() {
     window.addEventListener("storage", onStorage);
     return () => { channel.close(); window.removeEventListener("storage", onStorage); };
   }, []);
+
+  useEffect(() => {
+    if (!firebaseConfigured) {
+      setAuthLoading(false);
+      return undefined;
+    }
+    let active = true;
+    let stopAuth = () => {};
+    loadFirebaseAuth().then(client => {
+      if (!active) return;
+      setFirebaseClient(client);
+      stopAuth = client.authApi.onAuthStateChanged(client.auth, nextUser => {
+        setUser(nextUser);
+        setSyncError("");
+        setAuthLoading(false);
+      }, error => {
+        setSyncError(`Authentication failed: ${error.message}`);
+        setAuthLoading(false);
+      });
+    }).catch(error => {
+      if (active) {
+        setSyncError(`Firebase could not initialize: ${error.message}`);
+        setAuthLoading(false);
+      }
+    });
+    return () => { active = false; stopAuth(); };
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseClient || !user) {
+      setFirestore(null);
+      return undefined;
+    }
+    let active = true;
+    firebaseClient.loadFirestore().then(api => {
+      if (active) setFirestore(api);
+    }).catch(error => {
+      if (active) setSyncError(`Firestore could not initialize: ${error.message}`);
+    });
+    return () => { active = false; };
+  }, [user?.uid, firebaseClient, syncRetry]);
+
+  useEffect(() => {
+    if (!firebaseConfigured || !firestore || !user) return undefined;
+    let active = true;
+    let itemsLoaded = false;
+    let billsLoaded = false;
+    let initialLoadStarted = false;
+    let cloudReady = false;
+    const loadTimeout = setTimeout(() => {
+      if (active && !cloudReady) {
+        setSyncError("The cloud database is taking too long to respond. Check your connection and try again.");
+      }
+    }, 15000);
+    remoteDataRef.current = { items: [], bills: [] };
+    setReadyUserId(null);
+    setSyncError("");
+
+    async function initializeData() {
+      if (initialLoadStarted || !itemsLoaded || !billsLoaded) return;
+      initialLoadStarted = true;
+      const remote = remoteDataRef.current;
+      try {
+        const settingsRef = firestore.doc(firestore.db, "users", user.uid, "meta", "settings");
+        const settingsSnapshot = await firestore.getDoc(settingsRef);
+        if (!active) return;
+        const alreadyInitialized = settingsSnapshot.exists();
+        const canMigrateLocalData = !alreadyInitialized && !localStorage.getItem(MIGRATION_KEY);
+        const localData = canMigrateLocalData ? loadMigrationData() : null;
+        const initial = alreadyInitialized ? remote : !remote.items.length && !remote.bills.length
+          ? localData || starter
+          : localData ? mergeMigrationData(localData, remote) : remote;
+        if (!equalData(remote, initial)) {
+          await writeDataChanges(firestore, user.uid, remote, initial);
+        }
+        if (!active) return;
+        if (!alreadyInitialized) {
+          await firestore.setDoc(settingsRef, { initializedAt: new Date().toISOString() });
+        }
+        if (!active) return;
+        localStorage.setItem(MIGRATION_KEY, "true");
+        if (localData) localStorage.removeItem(STORE_KEY);
+        remoteDataRef.current = initial;
+        lastSyncedDataRef.current = initial;
+        setData(initial);
+        cloudReady = true;
+        clearTimeout(loadTimeout);
+        setSyncError("");
+        setReadyUserId(user.uid);
+      } catch (error) {
+        if (active) setSyncError(`Could not load cloud data: ${error.message}`);
+      }
+    }
+
+    function receiveRemoteData() {
+      remoteRevisionRef.current += 1;
+      if (!itemsLoaded || !billsLoaded) return;
+      if (!cloudReady) {
+        void initializeData();
+        return;
+      }
+      const remote = remoteDataRef.current;
+      const merged = mergeData(lastSyncedDataRef.current, dataRef.current, remote);
+      lastSyncedDataRef.current = remote;
+      setData(merged);
+    }
+
+    const stopItems = firestore.onSnapshot(firestore.collection(firestore.db, "users", user.uid, "items"), { includeMetadataChanges: true }, snapshot => {
+      remoteDataRef.current = { ...remoteDataRef.current, items: readCloudItems(snapshot) };
+      itemsLoaded = !snapshot.metadata.fromCache;
+      receiveRemoteData();
+    }, error => {
+      if (active) setSyncError(`Could not sync menu: ${error.message}`);
+    });
+    const stopBills = firestore.onSnapshot(firestore.collection(firestore.db, "users", user.uid, "bills"), { includeMetadataChanges: true }, snapshot => {
+      remoteDataRef.current = { ...remoteDataRef.current, bills: readCloudBills(snapshot) };
+      billsLoaded = !snapshot.metadata.fromCache;
+      receiveRemoteData();
+    }, error => {
+      if (active) setSyncError(`Could not sync bills: ${error.message}`);
+    });
+    return () => { active = false; clearTimeout(loadTimeout); stopItems(); stopBills(); };
+  }, [user?.uid, firestore, syncRetry]);
 
   useEffect(() => {
     if ("serviceWorker" in navigator && import.meta.env.PROD) {
@@ -126,7 +379,7 @@ function App() {
     reader.onload = () => {
       try {
         const parsed = JSON.parse(reader.result);
-        if (!Array.isArray(parsed.items) || !Array.isArray(parsed.bills)) throw new Error();
+        if (!validData(parsed)) throw new Error();
         if (confirm("Import this backup? It will replace the data currently on this device.")) {
           setData(parsed); setNotice("Backup imported.");
         }
@@ -141,18 +394,38 @@ function App() {
     setData(prev => ({ ...prev, bills: prev.bills.filter(b => b.id !== id) }));
   }
 
+  if (firebaseConfigured && authLoading) return <SyncGate/>;
+  if (firebaseConfigured && !firebaseClient) {
+    return <SyncGate error={syncError || "Firebase could not initialize."} onRetry={() => window.location.reload()}/>;
+  }
+  if (firebaseConfigured && !user && syncError) {
+    return <SyncGate error={syncError} onRetry={() => window.location.reload()}/>;
+  }
+  if (firebaseConfigured && !user) {
+    return <Suspense fallback={<SyncGate/>}><AuthScreen auth={firebaseClient.auth} authApi={firebaseClient.authApi}/></Suspense>;
+  }
+  if (firebaseConfigured && user && readyUserId !== user.uid) {
+    return <SyncGate
+      error={syncError}
+      onRetry={() => setSyncRetry(value => value + 1)}
+      onSignOut={() => firebaseClient.authApi.signOut(firebaseClient.auth).catch(error => setSyncError(`Sign out failed: ${error.message}`))}
+    />;
+  }
+
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
       <div className="brand"><div className="brand-mark"><Utensils size={20}/></div><div><b>messmate</b><small>MESS MANAGEMENT</small></div><button className="close-nav" onClick={() => setMobileNav(false)}><X size={18}/></button></div>
       <div className="nav-label">WORKSPACE</div>
       {[["Overview", LayoutDashboard], ["New bill", ReceiptText], ["Menu & prices", Settings2]].map(([label, Icon]) =>
         <button key={label} className={`nav-link ${page === label ? "active" : ""}`} onClick={() => { setPage(label); setMobileNav(false); }}><Icon size={18}/>{label}</button>)}
-      <div className="sidebar-bottom"><div className="sync-status"><span className="status-dot"></span><div><b>Local mode</b><small>Saved on this device</small></div></div><p>MessMate · v1.0</p></div>
+      <div className="sidebar-bottom"><div className={`sync-status ${firebaseConfigured ? "cloud-status" : "local-status"}`}><span className="status-dot"></span><div><b>{firebaseConfigured ? "Cloud sync on" : "Local mode"}</b><small>{firebaseConfigured ? user.email : "Saved on this device"}</small></div></div>{firebaseConfigured && <button className="sign-out-button" onClick={() => firebaseClient.authApi.signOut(firebaseClient.auth).catch(error => setSyncError(`Sign out failed: ${error.message}`))}><LogOut size={14}/> Sign out</button>}<p>MessMate · v1.0</p></div>
     </aside>
     {mobileNav && <div className="scrim" onClick={() => setMobileNav(false)} />}
     <main className="main">
-      <header className="topbar"><button className="mobile-menu" onClick={() => setMobileNav(true)}><Menu/></button><div><span className="eyebrow">MESS OPERATIONS</span><h1>{page}</h1></div><div className="top-actions"><label className="date-control"><CalendarDays size={16}/><input type="date" value={date} onChange={e => setDate(e.target.value)}/></label><div className="avatar">M</div></div></header>
+      <header className="topbar"><button className="mobile-menu" onClick={() => setMobileNav(true)}><Menu/></button><div><span className="eyebrow">MESS OPERATIONS</span><h1>{page}</h1></div><div className="top-actions"><label className="date-control"><CalendarDays size={16}/><input type="date" value={date} onChange={e => setDate(e.target.value)}/></label>{firebaseConfigured ? <div className="cloud-user"><Cloud size={16}/><span>{user.email}</span></div> : <div className="avatar">M</div>}</div></header>
       {notice && <div className="toast"><Check size={16}/>{notice}</div>}
+      {!firebaseConfigured && <div className="sync-alert setup-alert" role="status"><Cloud size={17}/><span>{missingFirebaseConfig.length ? `Cloud sync is not configured. Add ${missingFirebaseConfig.join(", ")} to enable it.` : "Cloud sync is not configured yet. Data is saved only in this browser."}</span></div>}
+      {syncError && readyUserId === user?.uid && <div className="sync-alert" role="alert"><span>{syncError}</span><button onClick={() => setSyncRetry(value => value + 1)}><RefreshCw size={14}/> Retry</button></div>}
       {page === "Overview" && <>
         <section className="welcome-row"><div><h2>Today at a glance</h2><p>Here’s how your mess is performing for the selected date.</p></div><button className="primary-btn" onClick={() => setPage("New bill")}><Plus size={17}/> Create bill</button></section>
         <section className="stats-grid">
