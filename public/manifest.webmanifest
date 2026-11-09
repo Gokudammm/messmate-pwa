@@ -1,0 +1,17 @@
+{
+  "name": "MessMate - Mess Manager",
+  "short_name": "MessMate",
+  "description": "Mess billing, shifts and payment tracking",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f6f2",
+  "theme_color": "#12251f",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
