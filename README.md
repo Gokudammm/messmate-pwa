@@ -31,7 +31,7 @@ The app uses Firebase Authentication and Cloud Firestore. Each account can read 
 
 1. Create a Firebase project and register a **Web app** in the Firebase console.
 2. In **Authentication → Sign-in method**, enable **Email/Password**.
-3. In **Firestore Database**, create a database and publish the rules from [`firestore.rules`](./firestore.rules).
+3. In **Firestore Database**, create a database and publish the rules from [`firestore.rules`](./firestore.rules). The root `firebase.json` also points Firebase CLI deployments at this rules file.
 4. Add the Firebase web-app values to a local `.env.local` file (copy `.env.example`) and to Vercel's **Project Settings → Environment Variables**:
    - `VITE_FIREBASE_API_KEY`
    - `VITE_FIREBASE_AUTH_DOMAIN`
